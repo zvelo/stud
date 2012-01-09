@@ -1,3 +1,21 @@
+stud (0.3~0.20111212zvelo3~lucid) lucid; urgency=low
+
+  * update the build dependencies
+
+ -- Joshua Rubin <jrubin@zvelo.com>  Fri, 06 Jan 2012 13:53:31 -0700
+
+stud (0.3~0.20111212zvelo2~lucid) lucid; urgency=low
+
+  * update the dependencies
+
+ -- Joshua Rubin <jrubin@zvelo.com>  Fri, 06 Jan 2012 13:51:22 -0700
+
+stud (0.3~0.20111212zvelo1~lucid) lucid; urgency=low
+
+  * make a zvelo lucid build
+
+ -- Joshua Rubin <jrubin@zvelo.com>  Fri, 06 Jan 2012 13:39:08 -0700
+
 stud (0.3~0.20111212) unstable; urgency=low
 
   * Initial release.
