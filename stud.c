@@ -47,6 +47,7 @@
 #include <pwd.h>
 #include <limits.h>
 #include <syslog.h>
+#include <stdarg.h>
 
 #include <ctype.h>
 #include <sched.h>
@@ -60,6 +61,7 @@
 
 #include "ringbuffer.h"
 #include "shctx.h"
+#include "configuration.h"
 
 #ifndef MSG_NOSIGNAL
 # define MSG_NOSIGNAL 0
@@ -70,16 +72,12 @@
 
 /* For Mac OS X */
 #ifndef TCP_KEEPIDLE
-# define TCP_KEEPIDLE TCP_KEEPALIVE
+# ifdef TCP_KEEPALIVE
+#  define TCP_KEEPIDLE TCP_KEEPALIVE
+# endif
 #endif
 #ifndef SOL_TCP
 # define SOL_TCP IPPROTO_TCP
-#endif
-
-#ifdef USE_SHARED_CACHE
-#ifndef MAX_SHCUPD_PEERS
-# define MAX_SHCUPD_PEERS 15
-#endif
 #endif
 
 /* Globals */
@@ -91,6 +89,7 @@ static int listener_socket;
 static int child_num;
 static pid_t *child_pids;
 static SSL_CTX *ssl_ctx;
+static SSL_SESSION *client_session;
 
 #ifdef USE_SHARED_CACHE
 static ev_io shcupd_listener;
@@ -98,83 +97,16 @@ static int shcupd_socket;
 struct addrinfo *shcupd_peers[MAX_SHCUPD_PEERS+1];
 static unsigned char shared_secret[SHA_DIGEST_LENGTH];
 
-typedef struct shcupd_peer_opt {
-     const char *ip;
-     const char *port;
-} shcupd_peer_opt;
+//typedef struct shcupd_peer_opt {
+//     const char *ip;
+//     const char *port;
+//} shcupd_peer_opt;
 
 #endif /*USE_SHARED_CACHE*/
 
 long openssl_version;
 int create_workers;
-
-/* Command line Options */
-typedef enum {
-    ENC_TLS,
-    ENC_SSL
-} ENC_TYPE;
-
-typedef struct stud_options {
-    ENC_TYPE ETYPE;
-    int WRITE_IP_OCTET;
-    int WRITE_PROXY_LINE;
-    const char* CHROOT;
-    uid_t UID;
-    gid_t GID;
-    const char *FRONT_IP;
-    const char *FRONT_PORT;
-    const char *BACK_IP;
-    const char *BACK_PORT;
-    long NCORES;
-    const char *CERT_FILE;
-    const char *CIPHER_SUITE;
-    const char *ENGINE;
-    int BACKLOG;
-#ifdef USE_SHARED_CACHE
-    int SHARED_CACHE;
-    const char *SHCUPD_IP;
-    const char *SHCUPD_PORT;
-    shcupd_peer_opt SHCUPD_PEERS[MAX_SHCUPD_PEERS+1];
-    const char *SHCUPD_MCASTIF;
-    const char *SHCUPD_MCASTTTL;
-#endif
-    int QUIET;
-    int SYSLOG;
-    int TCP_KEEPALIVE_TIME;
-    int DAEMONIZE;
-} stud_options;
-
-static stud_options OPTIONS = {
-    ENC_TLS,      // ETYPE
-    0,            // WRITE_IP_OCTET
-    0,            // WRITE_PROXY_LINE
-    NULL,         // CHROOT
-    0,            // UID
-    0,            // GID
-    NULL,         // FRONT_IP
-    "8443",       // FRONT_PORT
-    "127.0.0.1",  // BACK_IP
-    "8000",       // BACK_PORT
-    1,            // NCORES
-    NULL,         // CERT_FILE
-    NULL,         // CIPHER_SUITE
-    NULL,         // ENGINE
-    100,          // BACKLOG
-#ifdef USE_SHARED_CACHE
-    0,            // SHARED_CACHE
-    NULL,         // SHCUPD_IP
-    NULL,         // SHCUPD_PORT
-    { { NULL, NULL } }, // SHCUPD_PEERS
-    NULL,         // SHCUPD_MCASTIF
-    NULL,         // SHCUPD_MCASTTTL
-#endif
-    0,            // QUIET
-    0,            // SYSLOG
-    3600,         // TCP_KEEPALIVE_TIME
-    0             // DAEMONIZE
-};
-
-
+stud_config *CONFIG;
 
 static char tcp_proxy_line[128] = "";
 
@@ -182,8 +114,8 @@ static char tcp_proxy_line[128] = "";
  * handling */
 typedef enum _SHUTDOWN_REQUESTOR {
     SHUTDOWN_HARD,
-    SHUTDOWN_DOWN,
-    SHUTDOWN_UP
+    SHUTDOWN_CLEAR,
+    SHUTDOWN_SSL
 } SHUTDOWN_REQUESTOR;
 
 /*
@@ -192,23 +124,26 @@ typedef enum _SHUTDOWN_REQUESTOR {
  * All state associated with one proxied connection
  */
 typedef struct proxystate {
-    ringbuffer ring_down; /* pushing bytes from client to backend */
-    ringbuffer ring_up;   /* pushing bytes from backend to client */
+    ringbuffer ring_ssl2clear; /* pushing bytes from secure to clear stream */
+    ringbuffer ring_clear2ssl; /* pushing bytes from clear to secure stream */
 
-    ev_io ev_r_up;        /* Upstream write event */
-    ev_io ev_w_up;        /* Upstream read event */
+    ev_io ev_r_ssl;        /* secure stream write event */
+    ev_io ev_w_ssl;        /* secure stream read event */
 
-    ev_io ev_r_handshake; /* Downstream write event */
-    ev_io ev_w_handshake; /* Downstream read event */
+    ev_io ev_r_handshake; /* secure stream handshake write event */
+    ev_io ev_w_handshake; /* secure stream handshake read event */
 
-    ev_io ev_r_down;      /* Downstream write event */
-    ev_io ev_w_down;      /* Downstream read event */
+    ev_io ev_w_connect;    /* backend connect event */
+
+    ev_io ev_r_clear;      /* clear stream write event */
+    ev_io ev_w_clear;      /* clear stream read event */
 
     int fd_up;            /* Upstream (client) socket */
     int fd_down;          /* Downstream (backend) socket */
 
     int want_shutdown:1;  /* Connection is half-shutdown */
     int handshaked:1;     /* Initial handshake happened */
+    int clear_connected:1; /* clear stream is connected  */
     int renegotiation:1;  /* Renegotation is occuring */
 
     SSL *ssl;             /* OpenSSL SSL state */
@@ -218,14 +153,14 @@ typedef struct proxystate {
 
 #define LOG(...)                                        \
     do {                                                \
-      if (!OPTIONS.QUIET) fprintf(stdout, __VA_ARGS__); \
-      if (OPTIONS.SYSLOG) syslog(LOG_INFO, __VA_ARGS__);                    \
+      if (!CONFIG->QUIET) fprintf(stdout, __VA_ARGS__); \
+      if (CONFIG->SYSLOG) syslog(LOG_INFO, __VA_ARGS__);                    \
     } while(0)
 
 #define ERR(...)                    \
     do {                            \
       fprintf(stderr, __VA_ARGS__); \
-      if (OPTIONS.SYSLOG) syslog(LOG_ERR, __VA_ARGS__); \
+      if (CONFIG->SYSLOG) syslog(LOG_ERR, __VA_ARGS__); \
     } while(0)
 
 #define NULL_DEV "/dev/null"
@@ -246,16 +181,27 @@ static void settcpkeepalive(int fd) {
         ERR("Error activating SO_KEEPALIVE on client socket: %s", strerror(errno));
     }
 
-    optval = OPTIONS.TCP_KEEPALIVE_TIME;
+    optval = CONFIG->TCP_KEEPALIVE_TIME;
     optlen = sizeof(optval);
+#ifdef TCP_KEEPIDLE
     if(setsockopt(fd, SOL_TCP, TCP_KEEPIDLE, &optval, optlen) < 0) {
         ERR("Error setting TCP_KEEPIDLE on client socket: %s", strerror(errno));
     }
+#endif
 }
 
 static void fail(const char* s) {
     perror(s);
     exit(1);
+}
+
+void die (char *fmt, ...) {
+  va_list args;
+  va_start(args, fmt);
+  vfprintf(stderr, fmt, args);
+  va_end(args);
+
+  exit(1);
 }
 
 #ifndef OPENSSL_NO_DH
@@ -283,13 +229,15 @@ static int init_dh(SSL_CTX *ctx, const char *cert) {
     LOG("{core} DH initialized with %d bit key\n", 8*DH_size(dh));
     DH_free(dh);
 
+#ifndef OPENSSL_NO_EC
 #ifdef NID_X9_62_prime256v1
     EC_KEY *ecdh = NULL;
     ecdh = EC_KEY_new_by_curve_name(NID_X9_62_prime256v1);
     SSL_CTX_set_tmp_ecdh(ctx,ecdh);
     EC_KEY_free(ecdh);
     LOG("{core} ECDH Initialized with NIST P-256\n");
-#endif
+#endif /* NID_X9_62_prime256v1 */
+#endif /* OPENSSL_NO_EC */
 
     return 0;
 }
@@ -405,7 +353,7 @@ static int create_shcupd_socket() {
     hints.ai_family = AF_UNSPEC;
     hints.ai_socktype = SOCK_DGRAM;
     hints.ai_flags = AI_PASSIVE | AI_ADDRCONFIG;
-    const int gai_err = getaddrinfo(OPTIONS.SHCUPD_IP, OPTIONS.SHCUPD_PORT,
+    const int gai_err = getaddrinfo(CONFIG->SHCUPD_IP, CONFIG->SHCUPD_PORT,
                                     &hints, &ai);
     if (gai_err != 0) {
         ERR("{getaddrinfo}: [%s]\n", gai_strerror(gai_err));
@@ -440,28 +388,28 @@ static int create_shcupd_socket() {
         memset(&mreqn, 0, sizeof(mreqn));
         mreqn.imr_multiaddr.s_addr = ((struct sockaddr_in *)ai->ai_addr)->sin_addr.s_addr;
 
-        if (OPTIONS.SHCUPD_MCASTIF) {
-            if (isalpha(*OPTIONS.SHCUPD_MCASTIF)) { /* appears to be an iface name */
+        if (CONFIG->SHCUPD_MCASTIF) {
+            if (isalpha(*CONFIG->SHCUPD_MCASTIF)) { /* appears to be an iface name */
                 struct ifreq ifr;
 
                 memset(&ifr, 0, sizeof(ifr));
-                if (strlen(OPTIONS.SHCUPD_MCASTIF) > IFNAMSIZ) {
-                    ERR("Error iface name is too long [%s]\n",OPTIONS.SHCUPD_MCASTIF);
+                if (strlen(CONFIG->SHCUPD_MCASTIF) > IFNAMSIZ) {
+                    ERR("Error iface name is too long [%s]\n",CONFIG->SHCUPD_MCASTIF);
                     exit(1);
                 }
 
-                memcpy(ifr.ifr_name, OPTIONS.SHCUPD_MCASTIF, strlen(OPTIONS.SHCUPD_MCASTIF));
+                memcpy(ifr.ifr_name, CONFIG->SHCUPD_MCASTIF, strlen(CONFIG->SHCUPD_MCASTIF));
                 if (ioctl(s, SIOCGIFINDEX, &ifr)) {
                     fail("{ioctl: SIOCGIFINDEX}");
                 }
 
                 mreqn.imr_ifindex = ifr.ifr_ifindex;
             }
-            else if (strchr(OPTIONS.SHCUPD_MCASTIF,'.')) { /* appears to be an ipv4 address */
-                mreqn.imr_address.s_addr = inet_addr(OPTIONS.SHCUPD_MCASTIF);
+            else if (strchr(CONFIG->SHCUPD_MCASTIF,'.')) { /* appears to be an ipv4 address */
+                mreqn.imr_address.s_addr = inet_addr(CONFIG->SHCUPD_MCASTIF);
             }
             else { /* appears to be an iface index */
-                mreqn.imr_ifindex = atoi(OPTIONS.SHCUPD_MCASTIF);
+                mreqn.imr_ifindex = atoi(CONFIG->SHCUPD_MCASTIF);
             }
         }
 
@@ -480,15 +428,15 @@ static int create_shcupd_socket() {
         }
 
         /* optional set sockopts for sending to multicast msg */
-        if (OPTIONS.SHCUPD_MCASTIF &&
+        if (CONFIG->SHCUPD_MCASTIF &&
             setsockopt(s, IPPROTO_IP, IP_MULTICAST_IF, &mreqn, sizeof(mreqn)) < 0) {
             fail("{setsockopt: IP_MULTICAST_IF}");
         }
 
-        if (OPTIONS.SHCUPD_MCASTTTL) {
+        if (CONFIG->SHCUPD_MCASTTTL) {
              unsigned char ttl;
 
-             ttl = (unsigned char)atoi(OPTIONS.SHCUPD_MCASTTTL);
+             ttl = (unsigned char)atoi(CONFIG->SHCUPD_MCASTTTL);
              if (setsockopt(s, IPPROTO_IP, IP_MULTICAST_TTL, &ttl, sizeof(ttl)) < 0) {
                  fail("{setsockopt: IP_MULTICAST_TTL}");
              }
@@ -503,17 +451,17 @@ static int create_shcupd_socket() {
         memcpy(&mreq.ipv6mr_multiaddr, &((struct sockaddr_in6 *)ai->ai_addr)->sin6_addr,
                                        sizeof(mreq.ipv6mr_multiaddr));
 
-        if (OPTIONS.SHCUPD_MCASTIF) {
-            if (isalpha(*OPTIONS.SHCUPD_MCASTIF)) { /* appears to be an iface name */
+        if (CONFIG->SHCUPD_MCASTIF) {
+            if (isalpha(*CONFIG->SHCUPD_MCASTIF)) { /* appears to be an iface name */
                 struct ifreq ifr;
 
                 memset(&ifr, 0, sizeof(ifr));
-                if (strlen(OPTIONS.SHCUPD_MCASTIF) > IFNAMSIZ) {
-                    ERR("Error iface name is too long [%s]\n",OPTIONS.SHCUPD_MCASTIF);
+                if (strlen(CONFIG->SHCUPD_MCASTIF) > IFNAMSIZ) {
+                    ERR("Error iface name is too long [%s]\n",CONFIG->SHCUPD_MCASTIF);
                     exit(1);
                 }
 
-                memcpy(ifr.ifr_name, OPTIONS.SHCUPD_MCASTIF, strlen(OPTIONS.SHCUPD_MCASTIF));
+                memcpy(ifr.ifr_name, CONFIG->SHCUPD_MCASTIF, strlen(CONFIG->SHCUPD_MCASTIF));
                 if (ioctl(s, SIOCGIFINDEX, &ifr)) {
                     fail("{ioctl: SIOCGIFINDEX}");
                 }
@@ -521,7 +469,7 @@ static int create_shcupd_socket() {
                 mreq.ipv6mr_interface = ifr.ifr_ifindex;
             }
             else { /* option appears to be an iface index */
-                mreq.ipv6mr_interface = atoi(OPTIONS.SHCUPD_MCASTIF);
+                mreq.ipv6mr_interface = atoi(CONFIG->SHCUPD_MCASTIF);
             }
         }
 
@@ -545,10 +493,10 @@ static int create_shcupd_socket() {
             fail("{setsockopt: IPV6_MULTICAST_IF}");
         }
 
-        if (OPTIONS.SHCUPD_MCASTTTL) {
+        if (CONFIG->SHCUPD_MCASTTTL) {
             int hops;
 
-            hops = atoi(OPTIONS.SHCUPD_MCASTTTL);
+            hops = atoi(CONFIG->SHCUPD_MCASTTTL);
             if (setsockopt(s, IPPROTO_IPV6, IPV6_MULTICAST_HOPS, &hops, sizeof(hops)) < 0) {
                 fail("{setsockopt: IPV6_MULTICAST_HOPS}");
             }
@@ -587,7 +535,7 @@ RSA *load_rsa_privatekey(SSL_CTX *ctx, const char *file) {
 /* Init library and load specified certificate.
  * Establishes a SSL_ctx, to act as a template for
  * each connection */
-static SSL_CTX * init_openssl() {
+SSL_CTX * init_openssl() {
     SSL_library_init();
     SSL_load_error_strings();
     SSL_CTX *ctx = NULL;
@@ -596,12 +544,12 @@ static SSL_CTX * init_openssl() {
     long ssloptions = SSL_OP_NO_SSLv2 | SSL_OP_ALL | 
             SSL_OP_NO_SESSION_RESUMPTION_ON_RENEGOTIATION;
 
-    if (OPTIONS.ETYPE == ENC_TLS)
-        ctx = SSL_CTX_new(TLSv1_server_method());
-    else if (OPTIONS.ETYPE == ENC_SSL)
-        ctx = SSL_CTX_new(SSLv23_server_method());
+    if (CONFIG->ETYPE == ENC_TLS)
+        ctx = SSL_CTX_new((CONFIG->PMODE == SSL_CLIENT) ? TLSv1_client_method() : TLSv1_server_method());
+    else if (CONFIG->ETYPE == ENC_SSL)
+        ctx = SSL_CTX_new((CONFIG->PMODE == SSL_CLIENT) ? SSLv23_client_method() : SSLv23_server_method());
     else
-        assert(OPTIONS.ETYPE == ENC_TLS || OPTIONS.ETYPE == ENC_SSL);
+        assert(CONFIG->ETYPE == ENC_TLS || CONFIG->ETYPE == ENC_SSL);
 
 #ifdef SSL_OP_NO_COMPRESSION
     ssloptions |= SSL_OP_NO_COMPRESSION;
@@ -610,33 +558,13 @@ static SSL_CTX * init_openssl() {
     SSL_CTX_set_options(ctx, ssloptions);
     SSL_CTX_set_info_callback(ctx, info_callback);
 
-    if (SSL_CTX_use_certificate_chain_file(ctx, OPTIONS.CERT_FILE) <= 0) {
-        ERR_print_errors_fp(stderr);
-        exit(1);
-    }
-
-    rsa = load_rsa_privatekey(ctx, OPTIONS.CERT_FILE);
-    if(!rsa) {
-       ERR("Error loading rsa private key\n");
-       exit(1);
-    }
-
-    if (SSL_CTX_use_RSAPrivateKey(ctx,rsa) <= 0) {
-        ERR_print_errors_fp(stderr);
-        exit(1);
-    }
-
-#ifndef OPENSSL_NO_DH
-    init_dh(ctx, OPTIONS.CERT_FILE);
-#endif /* OPENSSL_NO_DH */
-
-    if (OPTIONS.ENGINE) {
+    if (CONFIG->ENGINE) {
         ENGINE *e = NULL;
         ENGINE_load_builtin_engines();
-        if (!strcmp(OPTIONS.ENGINE, "auto"))
+        if (!strcmp(CONFIG->ENGINE, "auto"))
             ENGINE_register_all_complete();
         else {
-            if ((e = ENGINE_by_id(OPTIONS.ENGINE)) == NULL ||
+            if ((e = ENGINE_by_id(CONFIG->ENGINE)) == NULL ||
                 !ENGINE_init(e) ||
                 !ENGINE_set_default(e, ENGINE_METHOD_ALL)) {
                 ERR_print_errors_fp(stderr);
@@ -648,17 +576,45 @@ static SSL_CTX * init_openssl() {
         }
     }
 
-    if (OPTIONS.CIPHER_SUITE)
-        if (SSL_CTX_set_cipher_list(ctx, OPTIONS.CIPHER_SUITE) != 1)
+    if (CONFIG->CIPHER_SUITE)
+        if (SSL_CTX_set_cipher_list(ctx, CONFIG->CIPHER_SUITE) != 1)
             ERR_print_errors_fp(stderr);
 
+    if (CONFIG->PREFER_SERVER_CIPHERS)
+        SSL_CTX_set_options(ctx, SSL_OP_CIPHER_SERVER_PREFERENCE);
+
+
+    if (CONFIG->PMODE == SSL_CLIENT)
+        return ctx;
+
+    /* SSL_SERVER Mode stuff */
+    if (SSL_CTX_use_certificate_chain_file(ctx, CONFIG->CERT_FILE) <= 0) {
+        ERR_print_errors_fp(stderr);
+        exit(1);
+    }
+
+    rsa = load_rsa_privatekey(ctx, CONFIG->CERT_FILE);
+    if(!rsa) {
+       ERR("Error loading rsa private key\n");
+       exit(1);
+    }
+
+    if (SSL_CTX_use_RSAPrivateKey(ctx,rsa) <= 0) {
+        ERR_print_errors_fp(stderr);
+        exit(1);
+    }
+
+#ifndef OPENSSL_NO_DH
+    init_dh(ctx, CONFIG->CERT_FILE);
+#endif /* OPENSSL_NO_DH */
+
 #ifdef USE_SHARED_CACHE
-    if (OPTIONS.SHARED_CACHE) {
-        if (shared_context_init(ctx, OPTIONS.SHARED_CACHE) < 0) {
+    if (CONFIG->SHARED_CACHE) {
+        if (shared_context_init(ctx, CONFIG->SHARED_CACHE) < 0) {
             ERR("Unable to alloc memory for shared cache.\n");
             exit(1);
         }
-	if (OPTIONS.SHCUPD_PORT) {
+	if (CONFIG->SHCUPD_PORT) {
             if (compute_secret(rsa, shared_secret) < 0) {
                 ERR("Unable to compute shared secret.\n");
                 exit(1);
@@ -714,7 +670,7 @@ static int create_main_socket() {
     hints.ai_family = AF_UNSPEC;
     hints.ai_socktype = SOCK_STREAM;
     hints.ai_flags = AI_PASSIVE | AI_ADDRCONFIG;
-    const int gai_err = getaddrinfo(OPTIONS.FRONT_IP, OPTIONS.FRONT_PORT,
+    const int gai_err = getaddrinfo(CONFIG->FRONT_IP, CONFIG->FRONT_PORT,
                                     &hints, &ai);
     if (gai_err != 0) {
         ERR("{getaddrinfo}: [%s]\n", gai_strerror(gai_err));
@@ -737,15 +693,17 @@ static int create_main_socket() {
         fail("{bind-socket}");
     }
 
+#ifndef NO_DEFER_ACCEPT
 #if TCP_DEFER_ACCEPT
     int timeout = 1; 
     setsockopt(s, IPPROTO_TCP, TCP_DEFER_ACCEPT, &timeout, sizeof(int) );
 #endif /* TCP_DEFER_ACCEPT */
+#endif
 
     prepare_proxy_line(ai->ai_addr);
 
     freeaddrinfo(ai);
-    listen(s, OPTIONS.BACKLOG);
+    listen(s, CONFIG->BACKLOG);
 
     return s;
 }
@@ -763,16 +721,9 @@ static int create_back_socket() {
     if (ret == -1) {
       perror("Couldn't setsockopt to backend (TCP_NODELAY)\n");
     }
-
-    int t = 1;
     setnonblocking(s);
-    t = connect(s, backaddr->ai_addr, backaddr->ai_addrlen);
-    if (t == 0 || errno == EINPROGRESS || errno == EINTR)
-        return s;
 
-    perror("{backend-connect}");
-
-    return -1;
+    return s;
 }
 
 /* Only enable a libev ev_io event if the proxied connection still
@@ -786,12 +737,13 @@ static void safe_enable_io(proxystate *ps, ev_io *w) {
  * has both up and down connected */
 static void shutdown_proxy(proxystate *ps, SHUTDOWN_REQUESTOR req) {
     if (ps->want_shutdown || req == SHUTDOWN_HARD) {
-        ev_io_stop(loop, &ps->ev_w_up);
-        ev_io_stop(loop, &ps->ev_r_up);
+        ev_io_stop(loop, &ps->ev_w_ssl);
+        ev_io_stop(loop, &ps->ev_r_ssl);
         ev_io_stop(loop, &ps->ev_w_handshake);
         ev_io_stop(loop, &ps->ev_r_handshake);
-        ev_io_stop(loop, &ps->ev_w_down);
-        ev_io_stop(loop, &ps->ev_r_down);
+        ev_io_stop(loop, &ps->ev_w_connect);
+        ev_io_stop(loop, &ps->ev_w_clear);
+        ev_io_stop(loop, &ps->ev_r_clear);
 
         close(ps->fd_up);
         close(ps->fd_down);
@@ -803,92 +755,105 @@ static void shutdown_proxy(proxystate *ps, SHUTDOWN_REQUESTOR req) {
     }
     else {
         ps->want_shutdown = 1;
-        if (req == SHUTDOWN_DOWN && ringbuffer_is_empty(&ps->ring_up))
+        if (req == SHUTDOWN_CLEAR && ringbuffer_is_empty(&ps->ring_clear2ssl))
             shutdown_proxy(ps, SHUTDOWN_HARD);
-        else if (req == SHUTDOWN_UP && ringbuffer_is_empty(&ps->ring_down))
+        else if (req == SHUTDOWN_SSL && ringbuffer_is_empty(&ps->ring_ssl2clear))
             shutdown_proxy(ps, SHUTDOWN_HARD);
     }
 }
 
 /* Handle various socket errors */
-static void handle_socket_errno(proxystate *ps) {
+static void handle_socket_errno(proxystate *ps, int backend) {
     if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)
         return;
 
     if (errno == ECONNRESET)
-        ERR("{backend} Connection reset by peer\n");
+        ERR("{%s} Connection reset by peer\n", backend ? "backend" : "client");
     else if (errno == ETIMEDOUT)
-        ERR("{backend} Connection to backend timed out\n");
+        ERR("{%s} Connection to backend timed out\n", backend ? "backend" : "client");
     else if (errno == EPIPE)
-        ERR("{backend} Broken pipe to backend (EPIPE)\n");
+        ERR("{%s} Broken pipe to backend (EPIPE)\n", backend ? "backend" : "client");
     else
         perror("{backend} [errno]");
-    shutdown_proxy(ps, SHUTDOWN_DOWN);
+    shutdown_proxy(ps, SHUTDOWN_CLEAR);
+}
+/* Start connect to backend */
+static void start_connect(proxystate *ps) {
+    int t = 1;
+    t = connect(ps->fd_down, backaddr->ai_addr, backaddr->ai_addrlen);
+    if (t == 0 || errno == EINPROGRESS || errno == EINTR) {
+        ev_io_start(loop, &ps->ev_w_connect);
+        return ;
+    }
+    perror("{backend-connect}");
+    shutdown_proxy(ps, SHUTDOWN_HARD);
 }
 
 /* Read some data from the backend when libev says data is available--
  * write it into the upstream buffer and make sure the write event is
  * enabled for the upstream socket */
-static void back_read(struct ev_loop *loop, ev_io *w, int revents) {
+static void clear_read(struct ev_loop *loop, ev_io *w, int revents) {
     (void) revents;
     int t;
     proxystate *ps = (proxystate *)w->data;
     if (ps->want_shutdown) {
-        ev_io_stop(loop, &ps->ev_r_down);
+        ev_io_stop(loop, &ps->ev_r_clear);
         return;
     }
     int fd = w->fd;
-    char * buf = ringbuffer_write_ptr(&ps->ring_up);
+    char * buf = ringbuffer_write_ptr(&ps->ring_clear2ssl);
     t = recv(fd, buf, RING_DATA_LEN, 0);
 
     if (t > 0) {
-        ringbuffer_write_append(&ps->ring_up, t);
-        if (ringbuffer_is_full(&ps->ring_up))
-            ev_io_stop(loop, &ps->ev_r_down);
-        safe_enable_io(ps, &ps->ev_w_up);
+        ringbuffer_write_append(&ps->ring_clear2ssl, t);
+        if (ringbuffer_is_full(&ps->ring_clear2ssl))
+            ev_io_stop(loop, &ps->ev_r_clear);
+        if (ps->handshaked)
+            safe_enable_io(ps, &ps->ev_w_ssl);
     }
     else if (t == 0) {
-        LOG("{backend} Connection closed\n");
-        shutdown_proxy(ps, SHUTDOWN_DOWN);
+        LOG("{%s} Connection closed\n", fd == ps->fd_down ? "backend" : "client");
+        shutdown_proxy(ps, SHUTDOWN_CLEAR);
     }
     else {
         assert(t == -1);
-        handle_socket_errno(ps);
+        handle_socket_errno(ps, fd == ps->fd_down ? 1 : 0);
     }
 }
 /* Write some data, previously received on the secure upstream socket,
  * out of the downstream buffer and onto the backend socket */
-static void back_write(struct ev_loop *loop, ev_io *w, int revents) {
+static void clear_write(struct ev_loop *loop, ev_io *w, int revents) {
     (void) revents;
     int t;
     proxystate *ps = (proxystate *)w->data;
     int fd = w->fd;
     int sz;
 
-    assert(!ringbuffer_is_empty(&ps->ring_down));
+    assert(!ringbuffer_is_empty(&ps->ring_ssl2clear));
 
-    char *next = ringbuffer_read_next(&ps->ring_down, &sz);
+    char *next = ringbuffer_read_next(&ps->ring_ssl2clear, &sz);
     t = send(fd, next, sz, MSG_NOSIGNAL);
 
     if (t > 0) {
         if (t == sz) {
-            ringbuffer_read_pop(&ps->ring_down);
-            safe_enable_io(ps, &ps->ev_r_up);
-            if (ringbuffer_is_empty(&ps->ring_down)) {
+            ringbuffer_read_pop(&ps->ring_ssl2clear);
+            if (ps->handshaked)
+                safe_enable_io(ps, &ps->ev_r_ssl);
+            if (ringbuffer_is_empty(&ps->ring_ssl2clear)) {
                 if (ps->want_shutdown) {
                     shutdown_proxy(ps, SHUTDOWN_HARD);
                     return; // dealloc'd
                 }
-                ev_io_stop(loop, &ps->ev_w_down);
+                ev_io_stop(loop, &ps->ev_w_clear);
             }
         }
         else {
-            ringbuffer_read_skip(&ps->ring_down, t);
+            ringbuffer_read_skip(&ps->ring_ssl2clear, t);
         }
     }
     else {
         assert(t == -1);
-        handle_socket_errno(ps);
+        handle_socket_errno(ps, fd == ps->fd_down ? 1 : 0);
     }
 }
 
@@ -900,57 +865,25 @@ static void handle_connect(struct ev_loop *loop, ev_io *w, int revents) {
     (void) revents;
     int t;
     proxystate *ps = (proxystate *)w->data;
-    char tcp6_address_string[INET6_ADDRSTRLEN];
-    size_t written = 0;
     t = connect(ps->fd_down, backaddr->ai_addr, backaddr->ai_addrlen);
     if (!t || errno == EISCONN || !errno) {
-        /* INIT */
-        ev_io_stop(loop, &ps->ev_w_down);
-        ev_io_init(&ps->ev_r_down, back_read, ps->fd_down, EV_READ);
-        ev_io_init(&ps->ev_w_down, back_write, ps->fd_down, EV_WRITE);
-        start_handshake(ps, SSL_ERROR_WANT_READ); /* for client-first handshake */
-        ev_io_start(loop, &ps->ev_r_down);
-        if (OPTIONS.WRITE_PROXY_LINE) {
-            char *ring_pnt = ringbuffer_write_ptr(&ps->ring_down);
-            assert(ps->remote_ip.ss_family == AF_INET ||
-		   ps->remote_ip.ss_family == AF_INET6);
-	    if(ps->remote_ip.ss_family == AF_INET) {
-	      struct sockaddr_in* addr = (struct sockaddr_in*)&ps->remote_ip;
-	      written = snprintf(ring_pnt,
-				 RING_DATA_LEN,
-				 tcp_proxy_line,
-				 "TCP4",
-				 inet_ntoa(addr->sin_addr),
-				 ntohs(addr->sin_port));
-	    }
-	    else if (ps->remote_ip.ss_family == AF_INET6) {
-	      struct sockaddr_in6* addr = (struct sockaddr_in6*)&ps->remote_ip;
-	      inet_ntop(AF_INET6,&(addr->sin6_addr),tcp6_address_string,INET6_ADDRSTRLEN);
-	      written = snprintf(ring_pnt,
-				 RING_DATA_LEN,
-				 tcp_proxy_line,
-				 "TCP6",
-				 tcp6_address_string,
-				 ntohs(addr->sin6_port));
-	    }   
-            ringbuffer_write_append(&ps->ring_down, written);
-            ev_io_start(loop, &ps->ev_w_down);
+        ev_io_stop(loop, &ps->ev_w_connect);
+
+        if (!ps->clear_connected) {
+            ps->clear_connected = 1;
+
+            /* if incoming buffer is not full */
+            if (!ringbuffer_is_full(&ps->ring_clear2ssl))
+                safe_enable_io(ps, &ps->ev_r_clear);
+
+            /* if outgoing buffer is not empty */
+            if (!ringbuffer_is_empty(&ps->ring_ssl2clear))
+                // not safe.. we want to resume stream even during half-closed
+                ev_io_start(loop, &ps->ev_w_clear);
         }
-        else if (OPTIONS.WRITE_IP_OCTET) {
-            char *ring_pnt = ringbuffer_write_ptr(&ps->ring_down);
-            assert(ps->remote_ip.ss_family == AF_INET ||
-                   ps->remote_ip.ss_family == AF_INET6);
-            *ring_pnt++ = (unsigned char) ps->remote_ip.ss_family;
-            if (ps->remote_ip.ss_family == AF_INET6) {
-                memcpy(ring_pnt, &((struct sockaddr_in6 *) &ps->remote_ip)
-                       ->sin6_addr.s6_addr, 16U);
-                ringbuffer_write_append(&ps->ring_down, 1U + 16U);
-            } else {
-                memcpy(ring_pnt, &((struct sockaddr_in *) &ps->remote_ip)
-                       ->sin_addr.s_addr, 4U);
-                ringbuffer_write_append(&ps->ring_down, 1U + 4U);
-            }
-            ev_io_start(loop, &ps->ev_w_down);
+        else {
+            /* Clear side already connected so connect is on secure side: perform handshake */
+            start_handshake(ps, SSL_ERROR_WANT_WRITE);
         }
     }
     else if (errno == EINPROGRESS || errno == EINTR || errno == EALREADY) {
@@ -965,8 +898,11 @@ static void handle_connect(struct ev_loop *loop, ev_io *w, int revents) {
 /* Upon receiving a signal from OpenSSL that a handshake is required, re-wire
  * the read/write events to hook up to the handshake handlers */
 static void start_handshake(proxystate *ps, int err) {
-    ev_io_stop(loop, &ps->ev_r_up);
-    ev_io_stop(loop, &ps->ev_w_up);
+    ev_io_stop(loop, &ps->ev_r_ssl);
+    ev_io_stop(loop, &ps->ev_w_ssl);
+
+    ps->handshaked = 0;
+
     if (err == SSL_ERROR_WANT_READ)
         ev_io_start(loop, &ps->ev_r_handshake);
     else if (err == SSL_ERROR_WANT_WRITE)
@@ -976,6 +912,8 @@ static void start_handshake(proxystate *ps, int err) {
 /* After OpenSSL is done with a handshake, re-wire standard read/write handlers
  * for data transmission */
 static void end_handshake(proxystate *ps) {
+    char tcp6_address_string[INET6_ADDRSTRLEN];
+    size_t written = 0;
     ev_io_stop(loop, &ps->ev_r_handshake);
     ev_io_stop(loop, &ps->ev_w_handshake);
 
@@ -985,14 +923,69 @@ static void end_handshake(proxystate *ps) {
     }
     ps->handshaked = 1;
 
+    /* Check if clear side is connected */
+    if (!ps->clear_connected) {
+        if (CONFIG->WRITE_PROXY_LINE) {
+            char *ring_pnt = ringbuffer_write_ptr(&ps->ring_ssl2clear);
+            assert(ps->remote_ip.ss_family == AF_INET ||
+                   ps->remote_ip.ss_family == AF_INET6);
+            if(ps->remote_ip.ss_family == AF_INET) {
+               struct sockaddr_in* addr = (struct sockaddr_in*)&ps->remote_ip;
+               written = snprintf(ring_pnt,
+                                  RING_DATA_LEN,
+                                  tcp_proxy_line,
+                                  "TCP4",
+                                  inet_ntoa(addr->sin_addr),
+                                  ntohs(addr->sin_port));
+               }
+               else if (ps->remote_ip.ss_family == AF_INET6) {
+                        struct sockaddr_in6* addr = (struct sockaddr_in6*)&ps->remote_ip;
+                        inet_ntop(AF_INET6,&(addr->sin6_addr),tcp6_address_string,INET6_ADDRSTRLEN);
+                        written = snprintf(ring_pnt,
+                                  RING_DATA_LEN,
+                                  tcp_proxy_line,
+                                  "TCP6",
+                                  tcp6_address_string,
+                                  ntohs(addr->sin6_port));
+            }   
+            ringbuffer_write_append(&ps->ring_ssl2clear, written);
+        }
+        else if (CONFIG->WRITE_IP_OCTET) {
+            char *ring_pnt = ringbuffer_write_ptr(&ps->ring_ssl2clear);
+            assert(ps->remote_ip.ss_family == AF_INET ||
+                   ps->remote_ip.ss_family == AF_INET6);
+            *ring_pnt++ = (unsigned char) ps->remote_ip.ss_family;
+            if (ps->remote_ip.ss_family == AF_INET6) {
+                memcpy(ring_pnt, &((struct sockaddr_in6 *) &ps->remote_ip)
+                       ->sin6_addr.s6_addr, 16U);
+                ringbuffer_write_append(&ps->ring_ssl2clear, 1U + 16U);
+            }
+            else {
+                memcpy(ring_pnt, &((struct sockaddr_in *) &ps->remote_ip)
+                       ->sin_addr.s_addr, 4U);
+                ringbuffer_write_append(&ps->ring_ssl2clear, 1U + 4U);
+            }
+        }
+	/* start connect now */
+        start_connect(ps);
+    }
+    else {
+        /* stud used in client mode, keep client session ) */
+        if (!SSL_session_reused(ps->ssl)) {
+            if (client_session)
+                SSL_SESSION_free(client_session);
+            client_session = SSL_get1_session(ps->ssl);
+        }
+    }
+
     /* if incoming buffer is not full */
-    if (!ringbuffer_is_full(&ps->ring_down))
-        safe_enable_io(ps, &ps->ev_r_up);
+    if (!ringbuffer_is_full(&ps->ring_ssl2clear))
+        safe_enable_io(ps, &ps->ev_r_ssl);
 
     /* if outgoing buffer is not empty */
-    if (!ringbuffer_is_empty(&ps->ring_up))
+    if (!ringbuffer_is_empty(&ps->ring_clear2ssl))
         // not safe.. we want to resume stream even during half-closed
-        ev_io_start(loop, &ps->ev_w_up);
+        ev_io_start(loop, &ps->ev_w_ssl);
 }
 
 /* The libev I/O handler during the OpenSSL handshake phase.  Basically, just
@@ -1018,54 +1011,55 @@ static void client_handshake(struct ev_loop *loop, ev_io *w, int revents) {
             ev_io_start(loop, &ps->ev_w_handshake);
         }
         else if (err == SSL_ERROR_ZERO_RETURN) {
-            LOG("{client} Connection closed (in handshake)\n");
-            shutdown_proxy(ps, SHUTDOWN_UP);
+            LOG("{%s} Connection closed (in handshake)\n", w->fd == ps->fd_up ? "client" : "backend");
+            shutdown_proxy(ps, SHUTDOWN_SSL);
         }
         else {
-            LOG("{client} Unexpected SSL error (in handshake): %d\n", err);
-            shutdown_proxy(ps, SHUTDOWN_UP);
+            LOG("{%s} Unexpected SSL error (in handshake): %d\n", w->fd == ps->fd_up ? "client" : "backend", err);
+            shutdown_proxy(ps, SHUTDOWN_SSL);
         }
     }
 }
 
 /* Handle a socket error condition passed to us from OpenSSL */
-static void handle_fatal_ssl_error(proxystate *ps, int err) {
+static void handle_fatal_ssl_error(proxystate *ps, int err, int backend) {
     if (err == SSL_ERROR_ZERO_RETURN)
-        ERR("{client} Connection closed (in data)\n");
+        ERR("{%s} Connection closed (in data)\n", backend ? "backend" : "client");
     else if (err == SSL_ERROR_SYSCALL)
         if (errno == 0)
-            ERR("{client} Connection closed (in data)\n");
+            ERR("{%s} Connection closed (in data)\n", backend ? "backend" : "client");
         else
-            perror("{client} [errno] ");
+            perror(backend ? "{backend} [errno] " : "{client} [errno] ");
     else
-        ERR("{client} Unexpected SSL_read error: %d\n", err);
-    shutdown_proxy(ps, SHUTDOWN_UP);
+        ERR("{%s} Unexpected SSL_read error: %d\n", backend ? "backend" : "client" , err);
+    shutdown_proxy(ps, SHUTDOWN_SSL);
 }
 
 /* Read some data from the upstream secure socket via OpenSSL,
  * and buffer anything we get for writing to the backend */
-static void client_read(struct ev_loop *loop, ev_io *w, int revents) {
+static void ssl_read(struct ev_loop *loop, ev_io *w, int revents) {
     (void) revents;
     int t;    
     proxystate *ps = (proxystate *)w->data;
     if (ps->want_shutdown) {
-        ev_io_stop(loop, &ps->ev_r_up);
+        ev_io_stop(loop, &ps->ev_r_ssl);
         return;
     }
-    char * buf = ringbuffer_write_ptr(&ps->ring_down);
+    char * buf = ringbuffer_write_ptr(&ps->ring_ssl2clear);
     t = SSL_read(ps->ssl, buf, RING_DATA_LEN);
 
     /* Fix CVE-2009-3555. Disable reneg if started by client. */
     if (ps->renegotiation) {
-        shutdown_proxy(ps, SHUTDOWN_UP);
+        shutdown_proxy(ps, SHUTDOWN_SSL);
         return;
     }
 
     if (t > 0) {
-        ringbuffer_write_append(&ps->ring_down, t);
-        if (ringbuffer_is_full(&ps->ring_down))
-            ev_io_stop(loop, &ps->ev_r_up);
-        safe_enable_io(ps, &ps->ev_w_down);
+        ringbuffer_write_append(&ps->ring_ssl2clear, t);
+        if (ringbuffer_is_full(&ps->ring_ssl2clear))
+            ev_io_stop(loop, &ps->ev_r_ssl);
+        if (ps->clear_connected)
+            safe_enable_io(ps, &ps->ev_w_clear);
     }
     else {
         int err = SSL_get_error(ps->ssl, t);
@@ -1074,34 +1068,35 @@ static void client_read(struct ev_loop *loop, ev_io *w, int revents) {
         }
         else if (err == SSL_ERROR_WANT_READ) { } /* incomplete SSL data */
         else
-            handle_fatal_ssl_error(ps, err);
+            handle_fatal_ssl_error(ps, err, w->fd == ps->fd_up ? 0 : 1);
     }
 }
 
 /* Write some previously-buffered backend data upstream on the
  * secure socket using OpenSSL */
-static void client_write(struct ev_loop *loop, ev_io *w, int revents) {
+static void ssl_write(struct ev_loop *loop, ev_io *w, int revents) {
     (void) revents;
     int t;
     int sz;
     proxystate *ps = (proxystate *)w->data;
-    assert(!ringbuffer_is_empty(&ps->ring_up));
-    char * next = ringbuffer_read_next(&ps->ring_up, &sz);
+    assert(!ringbuffer_is_empty(&ps->ring_clear2ssl));
+    char * next = ringbuffer_read_next(&ps->ring_clear2ssl, &sz);
     t = SSL_write(ps->ssl, next, sz);
     if (t > 0) {
         if (t == sz) {
-            ringbuffer_read_pop(&ps->ring_up);
-            safe_enable_io(ps, &ps->ev_r_down); // can be re-enabled b/c we've popped
-            if (ringbuffer_is_empty(&ps->ring_up)) {
+            ringbuffer_read_pop(&ps->ring_clear2ssl);
+            if (ps->clear_connected)
+                safe_enable_io(ps, &ps->ev_r_clear); // can be re-enabled b/c we've popped
+            if (ringbuffer_is_empty(&ps->ring_clear2ssl)) {
                 if (ps->want_shutdown) {
                     shutdown_proxy(ps, SHUTDOWN_HARD);
                     return;
                 }
-                ev_io_stop(loop, &ps->ev_w_up);
+                ev_io_stop(loop, &ps->ev_w_ssl);
             }
         }
         else {
-            ringbuffer_read_skip(&ps->ring_up, t);
+            ringbuffer_read_skip(&ps->ring_clear2ssl, t);
         }
     }
     else {
@@ -1111,7 +1106,7 @@ static void client_write(struct ev_loop *loop, ev_io *w, int revents) {
         }
         else if (err == SSL_ERROR_WANT_WRITE) {} /* incomplete SSL data */
         else
-            handle_fatal_ssl_error(ps, err);
+            handle_fatal_ssl_error(ps, err,  w->fd == ps->fd_up ? 0 : 1);
     }
 }
 
@@ -1120,6 +1115,7 @@ static void client_write(struct ev_loop *loop, ev_io *w, int revents) {
  * connecting to the backend */
 static void handle_accept(struct ev_loop *loop, ev_io *w, int revents) {
     (void) revents;
+    (void) loop;
     struct sockaddr_storage addr;
     socklen_t sl = sizeof(addr);
     int client = accept(w->fd, (struct sockaddr *) &addr, &sl);
@@ -1160,7 +1156,7 @@ static void handle_accept(struct ev_loop *loop, ev_io *w, int revents) {
 
     if (back == -1) {
         close(client);
-        perror("{backend-connect}");
+        perror("{backend-socket}");
         return;
     }
 
@@ -1180,33 +1176,37 @@ static void handle_accept(struct ev_loop *loop, ev_io *w, int revents) {
     ps->fd_down = back;
     ps->ssl = ssl;
     ps->want_shutdown = 0;
+    ps->clear_connected = 0;
     ps->handshaked = 0;
     ps->renegotiation = 0;
     ps->remote_ip = addr;
-    ringbuffer_init(&ps->ring_up);
-    ringbuffer_init(&ps->ring_down);
+    ringbuffer_init(&ps->ring_clear2ssl);
+    ringbuffer_init(&ps->ring_ssl2clear);
 
     /* set up events */
-    ev_io_init(&ps->ev_r_up, client_read, client, EV_READ);
-    ev_io_init(&ps->ev_w_up, client_write, client, EV_WRITE);
+    ev_io_init(&ps->ev_r_ssl, ssl_read, client, EV_READ);
+    ev_io_init(&ps->ev_w_ssl, ssl_write, client, EV_WRITE);
 
     ev_io_init(&ps->ev_r_handshake, client_handshake, client, EV_READ);
     ev_io_init(&ps->ev_w_handshake, client_handshake, client, EV_WRITE);
 
-    ev_io_init(&ps->ev_w_down, handle_connect, back, EV_WRITE);
-    ev_io_init(&ps->ev_r_down, back_read, back, EV_READ);
+    ev_io_init(&ps->ev_w_connect, handle_connect, back, EV_WRITE);
 
-    ev_io_start(loop, &ps->ev_w_down);
+    ev_io_init(&ps->ev_w_clear, clear_write, back, EV_WRITE);
+    ev_io_init(&ps->ev_r_clear, clear_read, back, EV_READ);
 
-    ps->ev_r_up.data = ps;
-    ps->ev_w_up.data = ps;
-    ps->ev_r_down.data = ps;
-    ps->ev_w_down.data = ps;
+    ps->ev_r_ssl.data = ps;
+    ps->ev_w_ssl.data = ps;
+    ps->ev_r_clear.data = ps;
+    ps->ev_w_clear.data = ps;
+    ps->ev_w_connect.data = ps;
     ps->ev_r_handshake.data = ps;
     ps->ev_w_handshake.data = ps;
 
     /* Link back proxystate to SSL state */
     SSL_set_app_data(ssl, ps);
+
+    start_handshake(ps, SSL_ERROR_WANT_READ); /* for client-first handshake */
 }
 
 
@@ -1222,6 +1222,105 @@ static void check_ppid(struct ev_loop *loop, ev_timer *w, int revents) {
 
 }
 
+static void handle_clear_accept(struct ev_loop *loop, ev_io *w, int revents) {
+    (void) revents;
+    (void) loop;
+    struct sockaddr_storage addr;
+    socklen_t sl = sizeof(addr);
+    int client = accept(w->fd, (struct sockaddr *) &addr, &sl);
+    if (client == -1) {
+        switch (errno) {
+        case EMFILE:
+            ERR("{client} accept() failed; too many open files for this process\n");
+            break;
+
+        case ENFILE:
+            ERR("{client} accept() failed; too many open files for this system\n");
+            break;
+
+        default:
+            assert(errno == EINTR || errno == EWOULDBLOCK || errno == EAGAIN);
+            break;
+        }
+        return;
+    }
+
+    int flag = 1;
+    int ret = setsockopt(client, IPPROTO_TCP, TCP_NODELAY, (char *)&flag, sizeof(flag) );
+    if (ret == -1) {
+      perror("Couldn't setsockopt on client (TCP_NODELAY)\n");
+    }
+#ifdef TCP_CWND
+    int cwnd = 10;
+    ret = setsockopt(client, IPPROTO_TCP, TCP_CWND, &cwnd, sizeof(cwnd));
+    if (ret == -1) {
+      perror("Couldn't setsockopt on client (TCP_CWND)\n");
+    }
+#endif
+
+    setnonblocking(client);
+    settcpkeepalive(client);
+
+    int back = create_back_socket();
+
+    if (back == -1) {
+        close(client);
+        perror("{backend-socket}");
+        return;
+    }
+
+    SSL_CTX * ctx = (SSL_CTX *)w->data;
+    SSL *ssl = SSL_new(ctx);
+    long mode = SSL_MODE_ENABLE_PARTIAL_WRITE;
+#ifdef SSL_MODE_RELEASE_BUFFERS
+    mode |= SSL_MODE_RELEASE_BUFFERS;
+#endif
+    SSL_set_mode(ssl, mode);
+    SSL_set_connect_state(ssl);
+    SSL_set_fd(ssl, back);
+    if (client_session)
+        SSL_set_session(ssl, client_session);
+
+    proxystate *ps = (proxystate *)malloc(sizeof(proxystate));
+
+    ps->fd_up = client;
+    ps->fd_down = back;
+    ps->ssl = ssl;
+    ps->want_shutdown = 0;
+    ps->clear_connected = 1;
+    ps->handshaked = 0;
+    ps->renegotiation = 0;
+    ps->remote_ip = addr;
+    ringbuffer_init(&ps->ring_clear2ssl);
+    ringbuffer_init(&ps->ring_ssl2clear);
+
+    /* set up events */
+    ev_io_init(&ps->ev_r_clear, clear_read, client, EV_READ);
+    ev_io_init(&ps->ev_w_clear, clear_write, client, EV_WRITE);
+
+    ev_io_init(&ps->ev_w_connect, handle_connect, back, EV_WRITE);
+
+    ev_io_init(&ps->ev_r_handshake, client_handshake, back, EV_READ);
+    ev_io_init(&ps->ev_w_handshake, client_handshake, back, EV_WRITE);
+
+
+    ev_io_init(&ps->ev_w_ssl, ssl_write, back, EV_WRITE);
+    ev_io_init(&ps->ev_r_ssl, ssl_read, back, EV_READ);
+
+    ps->ev_r_ssl.data = ps;
+    ps->ev_w_ssl.data = ps;
+    ps->ev_r_clear.data = ps;
+    ps->ev_w_clear.data = ps;
+    ps->ev_w_connect.data = ps;
+    ps->ev_r_handshake.data = ps;
+    ps->ev_w_handshake.data = ps;
+
+    /* Link back proxystate to SSL state */
+    SSL_set_app_data(ssl, ps);
+
+    ev_io_start(loop, &ps->ev_r_clear);
+    start_connect(ps); /* start connect */
+}
 
 /* Set up the child (worker) process including libev event loop, read event
  * on the bound socket, etc */
@@ -1250,7 +1349,7 @@ static void handle_connections() {
     ev_timer_init(&timer_ppid_check, check_ppid, 1.0, 1.0);
     ev_timer_start(loop, &timer_ppid_check);
 
-    ev_io_init(&listener, handle_accept, listener_socket, EV_READ);
+    ev_io_init(&listener, (CONFIG->PMODE == SSL_CLIENT) ? handle_clear_accept : handle_accept, listener_socket, EV_READ);
     listener.data = ssl_ctx;
     ev_io_start(loop, &listener);
 
@@ -1259,326 +1358,17 @@ static void handle_connections() {
     exit(1);
 }
 
-
-/* Print usage w/error message and exit failure */
-static void usage_fail(const char *prog, const char *msg) {
-    if (msg)
-        fprintf(stderr, "%s: %s\n", prog, msg);
-    fprintf(stderr, "usage: %s [OPTION] PEM\n", prog);
-
-    fprintf(stderr,
-"Encryption Methods:\n"
-"  --tls                    TLSv1 (default)\n"
-"  --ssl                    SSLv3 (implies no TLSv1)\n"
-"  -c CIPHER_SUITE          set allowed ciphers (default is OpenSSL defaults)\n"
-"  -e ENGINE                set OpenSSL engine\n"
-"\n"
-"Socket:\n"
-"  -b HOST,PORT             backend [connect] (default is \"127.0.0.1,8000\")\n"
-"  -f HOST,PORT             frontend [bind] (default is \"*,8443\")\n"
-#ifdef USE_SHARED_CACHE
-"  -U HOST,PORT             accept cache updates on udp (default disabled, needs shared cache enabled)\n"
-"  -P HOST[,PORT]           send cache updates to peer (multiple option, needs updates enabled)\n"
-"  -M IFACE[,TTL]           force iface and ttl to receive and send multicast updates\n"
-#endif
-"\n"
-"Performance:\n"
-"  -n CORES                 number of worker processes (default is 1)\n"
-"  -B BACKLOG               set listen backlog size (default is 100)\n"
-"  -k SECS                  Change default tcp keepalive on client socket\n"
-#ifdef USE_SHARED_CACHE
-"  -C SHARED_CACHE          set shared cache size in sessions (default no shared cache)\n"
-#endif
-"\n"
-"Security:\n"
-"  -r PATH                  chroot\n"
-"  -u USERNAME              set gid/uid after binding the socket\n"
-"\n"
-"Logging:\n"
-"  -q                       be quiet; emit only error messages\n"
-"  -s                       send log message to syslog in addition to stderr/stdout\n"
-"\n"
-"Special:\n"
-"  --daemon                 fork into background and become a daemon\n"
-"  --write-ip               write 1 octet with the IP family followed by the IP\n"
-"                           address in 4 (IPv4) or 16 (IPv6) octets little-endian\n"
-"                           to backend before the actual data\n"
-"  --write-proxy            write HaProxy's PROXY (IPv4 or IPv6) protocol line\n" 
-"                           before actual data\n"
-);
-    exit(1);
-}
-
-
-static void parse_host_and_port(const char *prog, const char *name, char *inp, int wildcard_okay, const char **ip, const char **port) {
-    char buf[150];
-    char *sp;
-
-    if (strlen(inp) >= sizeof buf) {
-        snprintf(buf, sizeof buf, "invalid option for %s HOST,PORT\n", name);
-        usage_fail(prog, buf);
-    }
-
-    sp = strchr(inp, ',');
-    if (!sp) {
-        snprintf(buf, sizeof buf, "invalid option for %s HOST,PORT\n", name);
-        usage_fail(prog, buf);
-    }
-
-    if (!strncmp(inp, "*", sp - inp)) {
-        if (!wildcard_okay) {
-            snprintf(buf, sizeof buf, "wildcard host specification invalid for %s\n", name);
-            usage_fail(prog, buf);
-        }
-        *ip = NULL;
-    }
-    else {
-        *sp = 0;
-        *ip = inp;
-    }
-    *port = sp + 1;
-}
-
-#ifdef USE_SHARED_CACHE
-/* Parse mcast and ttl options */
-static void parse_mcast_iface_and_ttl(const char *prog, const char *name, char *inp, const char **iface, const char **ttl) {
-    char buf[150];
-    char *sp;
-
-    if (strlen(inp) >= sizeof buf) {
-        snprintf(buf, sizeof buf, "invalid option for %s IFACE[,TTL]\n", name);
-        usage_fail(prog, buf);
-    }
-
-    sp = strchr(inp, ',');
-    if (!sp) {
-        if (!strcmp(inp, "*"))
-            *iface = NULL;
-        else
-            *iface = inp;
-        *ttl = NULL;
-        return;
-    }
-    else if (!strncmp(inp, "*", sp - inp)) {
-        *iface = NULL;
-    }
-    else {
-        *sp = 0;
-        *iface = inp;
-    }
-    *ttl = sp + 1;
-}
-
-static void parse_peer(const char *prog, const char *name, char *inp, const char **ip, const char **port) {
-    char buf[150];
-    char *sp;
-
-    if (strlen(inp) >= sizeof buf) {
-        snprintf(buf, sizeof buf, "invalid option for %s HOST[,PORT]\n", name);
-        usage_fail(prog, buf);
-    }
-
-    sp = strchr(inp, ',');
-    if (!sp) {
-        if (!strcmp(inp, "*")) {
-            snprintf(buf, sizeof buf, "wildcard host specification invalid for %s\n", name);
-            usage_fail(prog, buf);
-        }
-        else
-            *ip = inp;
-        *port = NULL;
-        return;
-    }
-    else if (!strncmp(inp, "*", sp - inp)) {
-        snprintf(buf, sizeof buf, "wildcard host specification invalid for %s\n", name);
-        usage_fail(prog, buf);
-    }
-    else {
-        *sp = 0;
-        *ip = inp;
-    }
-    *port = sp + 1;
-}
-
-/* Add shcupd peer to options */
-static void parse_peers(const char *prog, const char *name, char *inp) {
-    int i;
-
-    for (i = 0 ; i < MAX_SHCUPD_PEERS; i++) {
-         if (!OPTIONS.SHCUPD_PEERS[i].ip) {
-             parse_peer(prog, name, inp, &(OPTIONS.SHCUPD_PEERS[i].ip), &(OPTIONS.SHCUPD_PEERS[i].port));
-             memset(&(OPTIONS.SHCUPD_PEERS[i+1]), 0, sizeof(shcupd_peer_opt));
-             break;
-         }
-    }
-    if (i == MAX_SHCUPD_PEERS ) {
-        ERR("Maximum %s peers reach (%d)\n", name, MAX_SHCUPD_PEERS);
-        exit(1);
-    }
-}
-
-#endif /* USE_SHARED_CACHE */
-
-/* Handle command line arguments modifying behavior */
-static void parse_cli(int argc, char **argv) {
-    const char *prog = argv[0];
-
-    static int tls = 0, ssl = 0;
-    int c;
-    struct passwd* passwd;
-
-    static struct option long_options[] =
-    {
-        {"tls", 0, &tls, 1},
-        {"ssl", 0, &ssl, 1},
-        {"write-ip", 0, &OPTIONS.WRITE_IP_OCTET, 1},
-        {"write-proxy", 0, &OPTIONS.WRITE_PROXY_LINE, 1},
-        {"daemon", 0, &OPTIONS.DAEMONIZE, 1},
-        {0, 0, 0, 0}
-    };
-
-    while (1) {
-        int option_index = 0;
-        c = getopt_long(argc, argv, "hf:b:n:c:e:u:r:B:C:k:qsU:P:M:",
-                long_options, &option_index);
-
-        if (c == -1)
-            break;
-
-        switch (c) {
-
-        case 0:
-            break;
-
-        case 'n':
-            errno = 0;
-            OPTIONS.NCORES = strtol(optarg, NULL, 10);
-            if ((errno == ERANGE &&
-                (OPTIONS.NCORES == LONG_MAX || OPTIONS.NCORES == LONG_MIN)) ||
-                OPTIONS.NCORES < 1 || OPTIONS.NCORES > 128) {
-                usage_fail(prog, "invalid option for -n CORES; please provide an integer between 1 and 128\n");
-            }
-            break;
-
-        case 'b':
-            parse_host_and_port(prog, "-b", optarg, 0, &(OPTIONS.BACK_IP), &(OPTIONS.BACK_PORT));
-            break;
-
-        case 'f':
-            parse_host_and_port(prog, "-f", optarg, 1, &(OPTIONS.FRONT_IP), &(OPTIONS.FRONT_PORT));
-            break;
-            
-        case 'c':
-            OPTIONS.CIPHER_SUITE = optarg;
-            break;
-
-        case 'e':
-            OPTIONS.ENGINE = optarg;
-            break;
-
-        case 'u':
-            passwd = getpwnam(optarg);
-            if (!passwd) {
-                if (errno)
-                    fail("getpwnam failed");
-                else
-                    ERR("user not found: %s\n", optarg);
-                exit(1);
-            }
-            OPTIONS.UID = passwd->pw_uid;
-            OPTIONS.GID = passwd->pw_gid;
-            break;
-
-        case 'r':
-            if (optarg && optarg[0] == '/')
-                OPTIONS.CHROOT = optarg;
-            else {
-                ERR("chroot must be absolute path: \"%s\"\n", optarg);
-                exit(1);
-            }
-            break;
-
-        case 'B':
-            OPTIONS.BACKLOG = atoi(optarg);
-            if ( OPTIONS.BACKLOG <= 0 ) {
-                ERR("listen backlog can not be set to %d\n", OPTIONS.BACKLOG);
-                exit(1);
-            }
-            break;
-
-#ifdef USE_SHARED_CACHE
-        case 'C':
-            OPTIONS.SHARED_CACHE = atoi(optarg);
-            if ( OPTIONS.SHARED_CACHE < 0 ) {
-                ERR("shared cache size can not be set to %d\n", OPTIONS.SHARED_CACHE);
-                exit(1);
-            }
-            break;
-
-        case 'U':
-            parse_host_and_port(prog, "-U", optarg, 1, &(OPTIONS.SHCUPD_IP), &(OPTIONS.SHCUPD_PORT));
-            break;
-
-        case 'P':
-            parse_peers(prog, "-P", optarg);
-            break;
-
-        case 'M':
-            parse_mcast_iface_and_ttl(prog, "-M", optarg, &(OPTIONS.SHCUPD_MCASTIF), &(OPTIONS.SHCUPD_MCASTTTL));
-            break;
-#endif
-
-        case 'q':
-            OPTIONS.QUIET = 1;
-            break;
-        
-        case 's':
-            OPTIONS.SYSLOG = 1;
-            break;
-
-        case 'k':
-            OPTIONS.TCP_KEEPALIVE_TIME = atoi(optarg);
-            break;
-
-        default:
-            usage_fail(prog, NULL);
-        }
-    }
-
-    /* Post-processing */
-    if (tls && ssl)
-        usage_fail(prog, "Cannot specify both --tls and --ssl");
-
-    if (ssl)
-        OPTIONS.ETYPE = ENC_SSL; // implied.. else, TLS
-
-    if (OPTIONS.WRITE_IP_OCTET && OPTIONS.WRITE_PROXY_LINE)
-        usage_fail(prog, "Cannot specify both --write-ip and --write-proxy; pick one!");
-
-    argc -= optind;
-    argv += optind;
-
-    if (argc != 1)
-        usage_fail(prog, "exactly one argument is required: path to PEM file with cert/key");
-
-    OPTIONS.CERT_FILE = argv[0];
-
-    /* parent process can create new children */
-    create_workers = 1;
-}
-
-
 void change_root() {
-    if (chroot(OPTIONS.CHROOT) == -1)
+    if (chroot(CONFIG->CHROOT) == -1)
         fail("chroot");
     if (chdir("/"))
         fail("chdir");
 }
 
 void drop_privileges() {
-    if (setgid(OPTIONS.GID))
+    if (setgid(CONFIG->GID))
         fail("setgid failed");
-    if (setuid(OPTIONS.UID))
+    if (setuid(CONFIG->UID))
         fail("setuid failed");
 }
 
@@ -1590,7 +1380,7 @@ void init_globals() {
     hints.ai_family = AF_UNSPEC;
     hints.ai_socktype = SOCK_STREAM;
     hints.ai_flags = 0;
-    const int gai_err = getaddrinfo(OPTIONS.BACK_IP, OPTIONS.BACK_PORT,
+    const int gai_err = getaddrinfo(CONFIG->BACK_IP, CONFIG->BACK_PORT,
                                     &hints, &backaddr);
     if (gai_err != 0) {
         ERR("{getaddrinfo}: [%s]", gai_strerror(gai_err));
@@ -1598,9 +1388,9 @@ void init_globals() {
     }
 
 #ifdef USE_SHARED_CACHE
-    if (OPTIONS.SHARED_CACHE) {
+    if (CONFIG->SHARED_CACHE) {
         /* cache update peers addresses */
-        shcupd_peer_opt *spo = OPTIONS.SHCUPD_PEERS;
+        shcupd_peer_opt *spo = CONFIG->SHCUPD_PEERS;
         struct addrinfo **pai = shcupd_peers;
 
         while (spo->ip) {
@@ -1609,7 +1399,7 @@ void init_globals() {
             hints.ai_socktype = SOCK_DGRAM;
             hints.ai_flags = 0;
             const int gai_err = getaddrinfo(spo->ip,
-                                spo->port ? spo->port : OPTIONS.SHCUPD_PORT, &hints, pai);
+                                spo->port ? spo->port : CONFIG->SHCUPD_PORT, &hints, pai);
             if (gai_err != 0) {
                 ERR("{getaddrinfo}: [%s]", gai_strerror(gai_err));
                 exit(1);
@@ -1620,11 +1410,11 @@ void init_globals() {
     }
 #endif
     /* child_pids */
-    if ((child_pids = calloc(OPTIONS.NCORES, sizeof(pid_t))) == NULL)
+    if ((child_pids = calloc(CONFIG->NCORES, sizeof(pid_t))) == NULL)
         fail("calloc");
 
-    if (OPTIONS.SYSLOG)
-        openlog("stud", LOG_CONS | LOG_PID | LOG_NDELAY, LOG_DAEMON);
+    if (CONFIG->SYSLOG)
+        openlog("stud", LOG_CONS | LOG_PID | LOG_NDELAY, CONFIG->SYSLOG_FACILITY);
 }
 
 /* Forks COUNT children starting with START_INDEX.
@@ -1655,7 +1445,7 @@ void replace_child_with_pid(pid_t pid) {
     int i;
 
     /* find old child's slot and put a new child there */ 
-    for (i = 0; i < OPTIONS.NCORES; i++) {
+    for (i = 0; i < CONFIG->NCORES; i++) {
         if (child_pids[i] == pid) {
             start_children(i, 1);
             return;
@@ -1674,7 +1464,7 @@ static void do_wait(int __attribute__ ((unused)) signo) {
     if (pid == -1) {
         if (errno == ECHILD) {
             ERR("{core} All children have exited! Restarting...\n");
-            start_children(0, OPTIONS.NCORES);
+            start_children(0, CONFIG->NCORES);
         }
         else if (errno == EINTR) {
             ERR("{core} Interrupted wait\n");
@@ -1705,7 +1495,7 @@ static void sigh_terminate (int __attribute__ ((unused)) signo) {
 
         /* kill all children */
         int i;
-        for (i = 0; i < OPTIONS.NCORES; i++) {
+        for (i = 0; i < CONFIG->NCORES; i++) {
             /* LOG("Stopping worker pid %d.\n", child_pids[i]); */
             if (child_pids[i] > 1 && kill(child_pids[i], SIGTERM) != 0) {
                 ERR("{core} Unable to send SIGTERM to worker pid %d: %s\n", child_pids[i], strerror(errno));
@@ -1825,7 +1615,13 @@ void openssl_check_version() {
 /* Process command line args, create the bound socket,
  * spawn child (worker) processes, and respawn if any die */
 int main(int argc, char **argv) {
-    parse_cli(argc, argv);
+    // initialize configuration
+    CONFIG = config_new();
+    
+    // parse command line
+    config_parse_cli(argc, argv, CONFIG);
+    
+    create_workers = 1;
 
     openssl_check_version();
 
@@ -1836,7 +1632,7 @@ int main(int argc, char **argv) {
     listener_socket = create_main_socket();
 
 #ifdef USE_SHARED_CACHE
-    if (OPTIONS.SHCUPD_PORT) {
+    if (CONFIG->SHCUPD_PORT) {
         /* create socket to send(children) and
                receive(parent) cache updates */
     	shcupd_socket = create_shcupd_socket();
@@ -1846,17 +1642,17 @@ int main(int argc, char **argv) {
     /* load certificate, pass to handle_connections */
     ssl_ctx = init_openssl();
 
-    if (OPTIONS.CHROOT && OPTIONS.CHROOT[0])
+    if (CONFIG->CHROOT && CONFIG->CHROOT[0])
         change_root();
 
-    if (OPTIONS.UID || OPTIONS.GID)
+    if (CONFIG->UID || CONFIG->GID)
         drop_privileges();
 
     /* should we daemonize ?*/
-    if (OPTIONS.DAEMONIZE) {
+    if (CONFIG->DAEMONIZE) {
         /* disable logging to stderr */
-        OPTIONS.QUIET = 1;
-        OPTIONS.SYSLOG = 1;
+        CONFIG->QUIET = 1;
+        CONFIG->SYSLOG = 1;
 
         /* become a daemon */
         daemonize();
@@ -1864,10 +1660,10 @@ int main(int argc, char **argv) {
 
     master_pid = getpid();
 
-    start_children(0, OPTIONS.NCORES);
+    start_children(0, CONFIG->NCORES);
 
 #ifdef USE_SHARED_CACHE
-    if (OPTIONS.SHCUPD_PORT) {
+    if (CONFIG->SHCUPD_PORT) {
         /* start event loop to receive cache updates */
 
         loop = ev_default_loop(EVFLAG_AUTO);
@@ -1884,6 +1680,6 @@ int main(int argc, char **argv) {
          * Parent will be woken up if a signal arrives */
         pause();
     }
-
+    
     exit(0); /* just a formality; we never get here */
 }
