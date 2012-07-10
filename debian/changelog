@@ -1,3 +1,9 @@
+stud (0.3~0.20120710~precise) precise; urgency=low
+
+  * merge in latest changes
+
+ -- Joshua Rubin <jrubin@zvelo.com>  Tue, 10 Jul 2012 15:04:13 -0600
+
 stud (0.3~0.20111212zvelo3~lucid) lucid; urgency=low
 
   * update the build dependencies
